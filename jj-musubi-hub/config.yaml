@@ -9,7 +9,7 @@ arch:
   - aarch64
 init: false
 startup: services
-image: "ghcr.io/jscarrott/jj-musubi-hub-{arch}"
+image: "ghcr.io/jscarrott/{arch}-jj-musubi-hub"
 ports:
   22/tcp: 2222
 ports_description:

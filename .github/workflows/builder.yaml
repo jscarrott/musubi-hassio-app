@@ -1,163 +1,103 @@
 name: Builder
 
-env:
-  BUILD_ARGS: "--test"
-  MONITORED_FILES: "build.yaml config.yaml Dockerfile rootfs"
+# Builds the add-on's image for each architecture with Home Assistant's reusable builder
+# actions, and publishes it to ghcr.io/<owner>/<arch>-jj-musubi-hub:<version>, which is
+# what config.yaml's `image` points Supervisor at. Pull requests build without publishing.
+# An image is published once per add-on version: bump `version` in config.yaml to publish.
 
 on:
   push:
     branches:
       - main
+    paths:
+      - "jj-musubi-hub/**"
+      - ".github/workflows/builder.yaml"
   pull_request:
     branches:
       - main
-  # Builds and publishes every add-on, e.g. for the first images or to rebuild on a newer base.
+    paths:
+      - "jj-musubi-hub/**"
+      - ".github/workflows/builder.yaml"
   workflow_dispatch:
+
+env:
+  ADDON: jj-musubi-hub
+
+permissions:
+  contents: read
 
 jobs:
   init:
+    name: Initialize build
     runs-on: ubuntu-latest
-    name: Initialize builds
     outputs:
-      changed_addons: ${{ steps.changed_addons.outputs.addons }}
-      changed: ${{ steps.changed_addons.outputs.changed }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      version: ${{ steps.info.outputs.version }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7.0.1
 
-      - name: Get changed files
-        id: changed_files
-        if: github.event_name != 'workflow_dispatch'
-        uses: jitterbit/get-changed-files@v1
-
-      - name: Find add-on directories
-        id: addons
-        uses: home-assistant/actions/helpers/find-addons@master
-
-      - name: Get changed add-ons
-        id: changed_addons
+      - name: Read add-on version and architectures
+        id: info
         run: |
-          declare -a changed_addons
-          for addon in ${{ steps.addons.outputs.addons }}; do
-            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-              changed_addons+=("\"${addon}\",");
-            elif [[ "${{ steps.changed_files.outputs.all }}" =~ $addon ]]; then
-              for file in ${{ env.MONITORED_FILES }}; do
-                  if [[ "${{ steps.changed_files.outputs.all }}" =~ $addon/$file ]]; then
-                    if [[ ! "${changed_addons[@]}" =~ $addon ]]; then
-                      changed_addons+=("\"${addon}\",");
-                    fi
-                  fi
-              done
-            fi
-          done
+          version=$(yq -r '.version' "${ADDON}/config.yaml")
+          architectures=$(yq -o=json -I=0 '.arch' "${ADDON}/config.yaml")
+          echo "Add-on ${ADDON} ${version} for ${architectures}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "architectures=${architectures}" >> "$GITHUB_OUTPUT"
 
-          changed=$(echo ${changed_addons[@]} | rev | cut -c 2- | rev)
+      - name: Get build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.09.0
+        with:
+          architectures: ${{ steps.info.outputs.architectures }}
+          image-name: ${{ env.ADDON }}
 
-          if [[ -n ${changed} ]]; then
-            echo "Changed add-ons: $changed";
-            echo "changed=true" >> $GITHUB_OUTPUT;
-            echo "addons=[$changed]" >> $GITHUB_OUTPUT;
-          else
-            echo "No add-on had any monitored files changed (${{ env.MONITORED_FILES }})";
-          fi
   build:
+    name: Build ${{ matrix.arch }} image
     needs: init
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
-      packages: write
-    if: needs.init.outputs.changed == 'true'
-    name: Build ${{ matrix.arch }} ${{ matrix.addon }} add-on
+      contents: read # To check out the code
+      id-token: write # For Cosign signing
+      packages: write # To push images to GitHub Container Registry
     strategy:
-      matrix:
-        addon: ${{ fromJson(needs.init.outputs.changed_addons) }}
-        arch: ["aarch64", "amd64", "armhf", "armv7", "i386"]
-
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
     steps:
-      - name: Check out repository
+      - name: Check out the repository
         uses: actions/checkout@v7.0.1
 
-      - name: Get information
-        id: info
-        uses: home-assistant/actions/helpers/info@master
-        with:
-          path: "./${{ matrix.addon }}"
-
-      - name: Check if add-on should be built
-        id: check
+      # build.yaml is what Supervisor would use to build the add-on locally; the build here
+      # takes its base image, args and labels from it, so the two can't drift apart.
+      - name: Read build.yaml
+        id: build_config
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          if [[ "${{ steps.info.outputs.architectures }}" =~ ${{ matrix.arch }} ]]; then
-             echo "build_arch=true" >> $GITHUB_OUTPUT;
-             echo "image=$(echo ${{ steps.info.outputs.image }} | cut -d'/' -f3)" >> $GITHUB_OUTPUT;
-             if [[ -z "${{ github.head_ref }}" ]] && [[ "${{ github.event_name }}" != "pull_request" ]]; then
-                 echo "BUILD_ARGS=" >> $GITHUB_ENV;
-             fi
-           else
-             echo "${{ matrix.arch }} is not a valid arch for ${{ matrix.addon }}, skipping build";
-             echo "build_arch=false" >> $GITHUB_OUTPUT;
-          fi
+          build="${ADDON}/build.yaml"
+          {
+            echo "args<<EOF"
+            echo "BUILD_FROM=$(yq -r ".build_from.${ARCH}" "${build}")"
+            yq -r '(.args // {}) | to_entries | .[] | .key + "=" + (.value | tostring)' "${build}"
+            echo "EOF"
+            echo "labels<<EOF"
+            yq -r '(.labels // {}) | to_entries | .[] | .key + "=" + (.value | tostring)' "${build}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Login to GitHub Container Registry
-        if: env.BUILD_ARGS != '--test'
-        uses: docker/login-action@v4.7.0
+      - name: Build image
+        uses: home-assistant/builder/actions/build-image@2026.09.0
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build ${{ matrix.addon }} add-on
-        if: steps.check.outputs.build_arch == 'true'
-        uses: home-assistant/builder@2026.09.0
-        with:
-          args: |
-            ${{ env.BUILD_ARGS }} \
-            --${{ matrix.arch }} \
-            --target /data/${{ matrix.addon }} \
-            --image "${{ steps.check.outputs.image }}" \
-            --docker-hub "ghcr.io/${{ github.repository_owner }}" \
-            --addon
-  manifest:
-    needs: [init, build]
-    if: needs.init.outputs.changed == 'true' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    strategy:
-      matrix:
-        addon: ${{ fromJson(needs.init.outputs.changed_addons) }}
-    name: Publish multi-arch manifest for ${{ matrix.addon }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7.0.1
-
-      - name: Get add-on info
-        id: info
-        uses: home-assistant/actions/helpers/info@master
-        with:
-          path: "./${{ matrix.addon }}"
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push manifest
-        run: |
-          # info returns the image quoted and with its registry/owner prefix
-          # ("ghcr.io/<owner>/jj-musubi-hub-{arch}"). Keep only the name, as the
-          # build job does, so the owner prefix below is not applied twice.
-          image='${{ steps.info.outputs.image }}'
-          image=${image//\"/}
-          image=${image##*/}
-          base_image=${image/-\{arch\}/}
-          images=()
-
-          architectures=$(echo '${{ steps.info.outputs.architectures }}' | jq -r '.[]')
-          for arch in $architectures; do
-            images+=("ghcr.io/${{ github.repository_owner }}/${image/\{arch\}/$arch}")
-          done
-
-          printf 'Creating manifest ghcr.io/%s from %s\n' "${{ github.repository_owner }}/$base_image" "${images[*]}"
-          docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/$base_image" "${images[@]}"
+          arch: ${{ matrix.arch }}
+          context: ${{ env.ADDON }}
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.init.outputs.version }}
+            latest
+          version: ${{ needs.init.outputs.version }}
+          build-args: ${{ steps.build_config.outputs.args }}
+          labels: ${{ steps.build_config.outputs.labels }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          push: ${{ github.event_name != 'pull_request' }}
+          skip-existing: ${{ needs.init.outputs.version }}
