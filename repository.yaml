@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
+name: jj-musubi add-on repository
+url: 'https://github.com/jscarrott/musubi-hassio-app'
+maintainer: John Scarrott

@@ -1,0 +1,131 @@
+name: Sync jj-musubi releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+jobs:
+  sync:
+    name: Update jj-musubi version references
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Get latest jj-musubi release
+        id: latest
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.request('GET /repos/bos/jj-musubi/releases/latest');
+            let tag = data.tag_name || '';
+            if (tag.startsWith('v')) {
+              tag = tag.slice(1);
+            }
+            if (!tag) {
+              core.setFailed('Could not determine jj-musubi release tag');
+            }
+            core.setOutput('version', tag);
+
+      # The add-on's version is the musubi version it packages; build.yaml's MUSUBI_VERSION
+      # is what actually gets downloaded.
+      - name: Read current version
+        id: current
+        run: |
+          musubi=$(sed -nE 's/^[[:space:]]*MUSUBI_VERSION:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' \
+            jj-musubi-hub/build.yaml | head -n1)
+          if [ -z "$musubi" ]; then
+            echo "::error::Could not read MUSUBI_VERSION from jj-musubi-hub/build.yaml"
+            exit 1
+          fi
+          echo "Packaged jj-musubi: $musubi"
+          echo "musubi=$musubi" >> $GITHUB_OUTPUT
+
+      - name: Stop if already on latest jj-musubi
+        if: steps.latest.outputs.version == steps.current.outputs.musubi
+        run: |
+          echo "jj-musubi ${{ steps.latest.outputs.version }} is already packaged." >> $GITHUB_STEP_SUMMARY
+
+      # The checksums come from the release's own SHA256SUMS, so the image build checks the
+      # archives it downloads against what the release published.
+      - name: Update add-on to jj-musubi ${{ steps.latest.outputs.version }}
+        if: steps.latest.outputs.version != steps.current.outputs.musubi
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          PREVIOUS: ${{ steps.current.outputs.musubi }}
+        run: |
+          curl -fsSL -o SHA256SUMS \
+            "https://github.com/bos/jj-musubi/releases/download/v${VERSION}/SHA256SUMS"
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          previous = os.environ["PREVIOUS"]
+          sums = {}
+          for line in Path("SHA256SUMS").read_text().splitlines():
+              digest, name = line.split()
+              sums[name.lstrip("*")] = digest
+
+          def digest(target):
+              name = f"jj-musubi-{version}-{target}.tar.gz"
+              if name not in sums:
+                  raise SystemExit(f"{name} is not in the release's SHA256SUMS")
+              return sums[name]
+
+          build = Path("jj-musubi-hub/build.yaml")
+          text = build.read_text()
+          for key, value in {
+              "MUSUBI_VERSION": version,
+              "MUSUBI_SHA256_AMD64": digest("x86_64-unknown-linux-musl"),
+              "MUSUBI_SHA256_AARCH64": digest("aarch64-unknown-linux-musl"),
+          }.items():
+              text, count = re.subn(rf"(?m)^(\s*{key}:\s*).*$", rf"\g<1>{value}", text)
+              if count != 1:
+                  raise SystemExit(f"{key} not found in {build}")
+          build.write_text(text)
+
+          config = Path("jj-musubi-hub/config.yaml")
+          text, count = re.subn(r'(?m)^version:.*$', f'version: "{version}"', config.read_text())
+          if count != 1:
+              raise SystemExit(f"version not found in {config}")
+          config.write_text(text)
+
+          changelog = Path("jj-musubi-hub/CHANGELOG.md")
+          lines = changelog.read_text().splitlines()
+          header = lines[0]
+          rest = "\n".join(lines[1:]).lstrip()
+          entry = (
+              f"## {version}\n\n"
+              f"- Updated jj-musubi to **{version}** (from {previous}). See the "
+              f"[release notes](https://github.com/bos/jj-musubi/releases/tag/v{version}).\n\n"
+          )
+          changelog.write_text(f"{header}\n\n{entry}{rest}\n")
+          PY
+          rm SHA256SUMS
+
+      # Requires "Allow GitHub Actions to create and approve pull requests"
+      # (Settings -> Actions -> General).
+      - name: Create pull request
+        if: steps.latest.outputs.version != steps.current.outputs.musubi
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: automation/jj-musubi-${{ steps.latest.outputs.version }}
+          commit-message: "Package jj-musubi ${{ steps.latest.outputs.version }}"
+          title: "Update add-on to jj-musubi ${{ steps.latest.outputs.version }}"
+          body: |
+            ## Summary
+            - package jj-musubi ${{ steps.latest.outputs.version }} (was ${{ steps.current.outputs.musubi }}), with checksums from the release's SHA256SUMS
+            - bump the add-on version to match, so Supervisor offers the update
+            - merging lets the builder publish the new images
+
+            Machines that use this hub need the same musubi version, and the jj version it's built with.
+
+            ## Testing
+            - not run (automation workflow)
